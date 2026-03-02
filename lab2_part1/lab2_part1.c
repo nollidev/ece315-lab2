@@ -163,6 +163,7 @@ int main(void)
   q_rx_byte = xQueueCreate(RX_QUEUE_LEN, sizeof(uint8_t));
   q_cmd     = xQueueCreate(CMD_QUEUE_LEN, sizeof(crypto_request_t));
   q_result  = xQueueCreate(CMD_QUEUE_LEN, sizeof(crypto_result_t));  
+  // missing queue created here: q_tx
   q_tx = xQueueCreate(TX_QUEUE_LEN, sizeof(char));
   
   configASSERT(UART_RX_Task);
@@ -209,12 +210,11 @@ static void UART_TX_Task(void *pvParameters)
   char c;
 
   for (;;){
-    if (xQueueReceive(q_tx, &c, portMAX_DELAY) == pdTRUE){
-      uart_tx_byte((uint8_t)c);  
-     
+    // modified the statement(s) below to replace the blocking operation
+    if (xQueueReceive(q_tx, &c, 0) == pdTRUE){
+      uart_tx_byte((uint8_t)c);
     } 
-    //XUartPs_IsReceiveData(UART_BASEADDR);
-    //vTaskDelay(pdMS_TO_TICKS(POLL_DELAY_MS));
+    vTaskDelay(pdMS_TO_TICKS(POLL_DELAY_MS));
   }
 }
 
@@ -349,16 +349,20 @@ void receive_string(char *buf, size_t buf_len)
     uint8_t recvd;
     size_t idx = 0;
     buf[0] = '\0';
+    uint8_t len = 0;
 
     while (1){
 		
-        vTaskDelay(pdMS_TO_TICKS(POLL_DELAY_MS)); 
-        //XUartPs_WriteReg(UART_BASEADDR, XUARTPS_FIFO_OFFSET, idx); 
+        // finish implementation of this method
+        XUartPs_WriteReg(UART_BASEADDR, XUARTPS_FIFO_OFFSET, idx); 
          
-        if (XUartPs_IsReceiveData(UART_BASEADDR)) {  
+        if (XUartPs_IsReceiveData(UART_BASEADDR) == pdTRUE && sizeof(buf) < buf_len) {  
             recvd = XUartPs_ReadReg(UART_BASEADDR, XUARTPS_FIFO_OFFSET);
+            buf[len] = recvd;
+            buf[++len] = '\0';
         } 
         
+        vTaskDelay(pdMS_TO_TICKS(POLL_DELAY_MS)); 
     }
 }
 
