@@ -349,21 +349,13 @@ void receive_string(char *buf, size_t buf_len)
     uint8_t recvd;
     size_t idx = 0;
     buf[0] = '\0';
-    uint64_t len = 0;
 
-    while (1){
-		
-        // finish implementation of this method
-        XUartPs_WriteReg(UART_BASEADDR, XUARTPS_FIFO_OFFSET, idx); 
-         
-        if (XUartPs_IsReceiveData(UART_BASEADDR) == pdTRUE && sizeof(buf) < buf_len) {  
-            recvd = XUartPs_ReadReg(UART_BASEADDR, XUARTPS_FIFO_OFFSET);
-            if (recvd == '\r') { return; }
-            buf[len] = recvd;
-            buf[++len] = '\0';
-        } 
-        
-        vTaskDelay(pdMS_TO_TICKS(POLL_DELAY_MS)); 
+    // finish implementation of this method
+    while (idx < buf_len){
+        receive_byte(&recvd);
+        if (recvd == '\r') { return; }
+        buf[idx] = recvd;
+        buf[++idx] = '\0'; 
     }
 }
 
@@ -378,8 +370,10 @@ void flush_uart(void)
 void print_string(const char *str)
 {
     // reimplement new print function
-    xil_printf(str);
-    xQueueSend(q_tx, str, 0);
+    while (*str) {
+        uint8_t c = *str++;
+        xQueueSend(q_tx, &c, pdMS_TO_TICKS(POLL_DELAY_MS));
+    }
 }
 
 void print_new_lines(int count)
