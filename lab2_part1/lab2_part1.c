@@ -1,5 +1,5 @@
 /*
- *	Lab 2: Part 2: UART in Polling Mode
+ *	Lab 2: Part 1: UART in Polling Mode
  *
  *	ECE 315		: Computer Interfacing
  *  Created on	: July 27, 2021
