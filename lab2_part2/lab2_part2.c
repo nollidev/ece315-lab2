@@ -1,5 +1,5 @@
 /*
- * Lab 2, Part 2 - Seven-Segment Display & Keypad
+ * Lab 1, Part 2 - Seven-Segment Display & Keypad
  *
  * ECE-315 WINTER 2025 - COMPUTER INTERFACING
  * Created on: February 5, 2021
@@ -36,10 +36,19 @@
 #include <sleep.h>
 #include <xil_cache.h>
 #include <xstatus.h>
+#include "xuartps.h"
 
 // Other miscellaneous libraries
 #include "pmodkypd.h"
 #include "rgb_led.h"
+#include <portmacro.h>
+#include <projdefs.h>
+#include <stdint.h>
+#include <string.h>
+#include <stdio.h>
+#include <xil_io.h>
+#include <xil_printf.h>
+#include <xuartps_hw.h>
 
 
 // Device ID declarations
@@ -53,6 +62,16 @@
 
 // keypad key table
 #define DEFAULT_KEYTABLE 	"0FED789C456B123A"
+
+// ======================================================
+// Configuration
+// ======================================================
+#define UART_BASEADDR 	XPAR_UART1_BASEADDR
+#define RX_QUEUE_LEN     512
+#define CMD_QUEUE_LEN     16
+#define TX_QUEUE_LEN     512
+
+#define POLL_DELAY_MS     20
 
 // Declaring the devices
 PmodKYPD 	KYPDInst;
@@ -69,12 +88,86 @@ void InitializeKeypad();
 static void vKeypadTask( void *pvParameters );
 static void vRgbTask( void *pvParameters );
 static void vButtonsTask();
-static void vDisplayTask();
+static void vDisplayTask(); 
+static void UART_RX_Task(void *pvParameters);
+static void UART_TX_Task(void *pvParameters);
+static void CLI_Task(void *pvParameters);
 u32 SSD_decode(u8 key_value, u8 cathode);
 
 QueueHandle_t keypadToSSDQueue;
 QueueHandle_t buttonsToLEDQueue;
+QueueHandle_t uartToSSDQueue;
+QueueHandle_t uartToLEDIncQueue;  
+QueueHandle_t uartToLEDClrQueue;
 
+// ======================================================
+// FreeRTOS objects
+// ======================================================
+static QueueHandle_t q_rx_byte = NULL;   // uint8_t
+static QueueHandle_t q_tx      = NULL;   // char
+
+// ======================================================
+// UART instance
+// ======================================================
+static XUartPs UartPs;
+
+typedef enum {
+  CMD_NONE,
+  CMD_SSD_1 = '1',
+  CMD_SSD_2 = '2',
+  CMD_SSD_3 = '3',
+  CMD_SSD_4 = '4',
+  CMD_SSD_5 = '5',
+  CMD_SSD_6 = '6',
+  CMD_SSD_7 = '7',
+  CMD_SSD_8 = '8',
+  CMD_SSD_9 = '9',
+  CMD_SSD_0 = '0',
+  CMD_SSD_A = 'A',
+  CMD_SSD_B = 'B',
+  CMD_SSD_C = 'C',
+  CMD_SSD_D = 'D',
+  CMD_SSD_E = 'E',
+  CMD_SSD_F = 'F',
+  CMD_RGB_HIGH = 'h',
+  CMD_RGB_LOW = 'l',
+  CMD_RGB_RED = 'r',
+  CMD_RGB_GREEN = 'g',
+  CMD_RGB_BLUE = 'b',
+  CMD_RGB_YELLOW = 'y',
+  CMD_RGB_CYAN = 'c',
+  CMD_RGB_MAGENTA = 'm',
+  CMD_RGB_WHITE = 'w'
+} command_type_t;
+
+typedef enum { 
+    UARTCMD_SSD, 
+    UARTCMD_NONE, 
+    UARTCMD_BRIGHT, 
+    UARTCMD_COLOR
+}uartcmd_type_t; 
+
+typedef struct { 
+    // uartcmd_type_t type; 
+    uint8_t cmd; 
+}uart_cmd_t;
+
+
+// ======================================================
+// UART helpers
+// ======================================================
+uint8_t receive_byte(uint8_t *out_byte);
+// // void receive_string(char *buf, size_t buf_len);
+static void uart_init(void);
+static int uart_poll_rx(uint8_t *b);
+static void uart_tx_byte(uint8_t b);
+
+
+// ======================================================
+// Custom UART functions
+// ======================================================
+void print_string(const char *str);
+void flush_uart(void);
 
 int main(void)
 {
@@ -82,6 +175,9 @@ int main(void)
 
 	// Initialize keypad
 	InitializeKeypad();
+
+    // Initialize UART
+    uart_init();
 
 /*************************** Enter your code here ****************************/
 	// TODO: Initialize SSD and set the GPIO direction to output.
@@ -110,7 +206,7 @@ int main(void)
     XGpio_SetDataDirection(&pushButtonInst, 1, 0x01);
 /********************************************   *********************************/
 
-	xil_printf("Initialization Complete, System Ready!\n");
+	xil_printf("\n\n\nInitialization Complete, System Ready!\n");
 
 	xTaskCreate(vKeypadTask,					/* The function that implements the task. */
 				"main task", 				/* Text name for the task, provided to assist debugging only. */
@@ -138,10 +234,36 @@ int main(void)
                 configMINIMAL_STACK_SIZE, 	/* The stack allocated to the task. */
                 NULL, 						/* The task parameter is not used, so set to NULL. */
                 tskIDLE_PRIORITY,			/* The task runs at the idle priority. */
+                NULL); 
+    
+    xTaskCreate(UART_RX_Task,					/* The function that implements the task. */
+                "UART task", 				/* Text name for the task, provided to assist debugging only. */
+                configMINIMAL_STACK_SIZE, 	/* The stack allocated to the task. */
+                NULL, 						/* The task parameter is not used, so set to NULL. */
+                tskIDLE_PRIORITY,			/* The task runs at the idle priority. */
+                NULL);
+    
+    xTaskCreate(UART_TX_Task, 
+                "UART_TX", 
+                 configMINIMAL_STACK_SIZE, 	/* The stack allocated to the task. */
+                NULL, 						/* The task parameter is not used, so set to NULL. */
+                tskIDLE_PRIORITY,			/* The task runs at the idle priority. */
+                NULL);
+
+    xTaskCreate(CLI_Task, 
+                "CLI",     
+                 configMINIMAL_STACK_SIZE, 	/* The stack allocated to the task. */
+                NULL, 						/* The task parameter is not used, so set to NULL. */
+                tskIDLE_PRIORITY,			/* The task runs at the idle priority. */
                 NULL);
 
     keypadToSSDQueue = xQueueCreate(1, sizeof(u8));
-    buttonsToLEDQueue = xQueueCreate(1, sizeof(TickType_t));
+    buttonsToLEDQueue = xQueueCreate(1, sizeof(TickType_t)); 
+    uartToSSDQueue = xQueueCreate(CMD_QUEUE_LEN, sizeof(uart_cmd_t)); 
+    uartToLEDIncQueue = xQueueCreate(CMD_QUEUE_LEN, sizeof(uart_cmd_t));
+    uartToLEDClrQueue = xQueueCreate(CMD_QUEUE_LEN, sizeof(uart_cmd_t));
+    q_rx_byte = xQueueCreate(RX_QUEUE_LEN, sizeof(uint8_t));
+    q_tx = xQueueCreate(TX_QUEUE_LEN, sizeof(char));
 
 	vTaskStartScheduler();
 	while(1);
@@ -194,7 +316,7 @@ static void vDisplayTask()
     TickType_t xDelay = 10;
 
     while(1){
-        if (xQueueReceive(keypadToSSDQueue, &new_key, 1)) {
+        if (xQueueReceive(keypadToSSDQueue, &new_key, 1) || xQueueReceive(uartToSSDQueue, &new_key, 1)) {
             previous_key = current_key;
             current_key = new_key;
         }
@@ -260,6 +382,7 @@ static void vButtonsTask()
     XStatus state, previous_state = PUSH_NO_STATE;
     TickType_t inputDelay = 300;
     u16 increment = 1;
+    uint8_t uartCmd;
     const TickType_t xPeriod = 20;
     TickType_t xOnDelay = 10;
     
@@ -269,14 +392,23 @@ static void vButtonsTask()
         if (state != previous_state){
             if (state == PUSH_DECREMENT_STATE && xOnDelay > 0) {
                 xOnDelay -= increment; 
-                
                 vTaskDelay(inputDelay);
             } else if (state == PUSH_INCREMENT_STATE && (xPeriod - xOnDelay) > 0) {
                 xOnDelay += increment;
                 vTaskDelay(inputDelay);
             } 
             xQueueOverwrite(buttonsToLEDQueue, &xOnDelay);
-            
+        }
+
+        else if (xQueueReceive(uartToLEDIncQueue, &uartCmd, 1)){
+            if (uartCmd == PUSH_DECREMENT_STATE && xOnDelay > 0) {
+                xOnDelay -= increment; 
+                vTaskDelay(inputDelay);
+            } else if (uartCmd == PUSH_INCREMENT_STATE && (xPeriod - xOnDelay) > 0) {
+                xOnDelay += increment;
+                vTaskDelay(inputDelay);
+            } 
+            xQueueOverwrite(buttonsToLEDQueue, &xOnDelay);
         }
     }
     
@@ -284,16 +416,21 @@ static void vButtonsTask()
 
 static void vRgbTask(void *pvParameters)
 {
-    const uint8_t color = RGB_CYAN;
+    uint8_t color = RGB_CYAN;
     const TickType_t xPeriod = 20;
     TickType_t xOnDelay = 10;  
     TickType_t xOffDelay = xPeriod - xOnDelay;  
 
-	xil_printf("\nxPeriod: %d\n", xPeriod);   
+    // xil_printf("\nxPeriod: %d\n", xPeriod);   
 
     while (1){  
+        
+        if (xQueueReceive(uartToLEDClrQueue, &color, 1)) {
+            xil_printf("\nColor changed");
+        }
+        
         if (xQueueReceive(buttonsToLEDQueue,&xOnDelay,1)){
-            xil_printf("\nxOnDelay: %d\txOffDelay: %d\n", xOnDelay, xPeriod - xOnDelay);
+            xil_printf("\nBrightness: %d", (xOnDelay * 100) / xPeriod);
         }      
 
         xOffDelay = xPeriod - xOnDelay;
@@ -305,5 +442,186 @@ static void vRgbTask(void *pvParameters)
        
         XGpio_DiscreteWrite(&rgbLedInst, RGB_CHANNEL, 0);
         vTaskDelay((xOffDelay)); 
+    } 
+
+    
+} 
+
+static void UART_RX_Task(void *pvParameters) {  
+  uint8_t byte;
+
+  for (;;){
+    if (uart_poll_rx(&byte)){
+      xQueueSend(q_rx_byte, &byte, 0); 
+    } 
+    vTaskDelay(pdMS_TO_TICKS(POLL_DELAY_MS));
+  }
+}
+
+// ======================================================
+// UART TX Task
+// ======================================================
+
+static void UART_TX_Task(void *pvParameters)
+{
+
+  char c;
+
+  for (;;){
+    // modified the statement(s) below to replace the blocking operation
+    if (xQueueReceive(q_tx, &c, 0) == pdTRUE){
+      uart_tx_byte((uint8_t)c);
+    } 
+    vTaskDelay(pdMS_TO_TICKS(POLL_DELAY_MS));
+  }
+}
+
+
+// ======================================================
+// CLI Task
+// ======================================================
+
+static void CLI_Task(void *pvParameters)
+{
+    command_type_t op = CMD_NONE;
+    uart_cmd_t cmd;
+
+    vTaskDelay(pdMS_TO_TICKS(20));
+
+    print_string((const char *)pvParameters);
+    // print_string("\n*******************************************\n");
+    print_string("CLI Menu:\n\tSSD Commands: 1; 2; 3; 4; 5; 6; 7; 8; 9; 0; A; B; C; D; E; F\n");
+    print_string("\tRGB Commands: (h)igh; (l)ow; (r)ed; (g)reen; (b)lue; (y)ellow; (c)yan; (m)agenta; (w)hite\n");
+
+    for (;;){
+
+        print_string("\nEnter your option: ");
+        receive_byte((uint8_t *)&op);
+
+        // print_string("\n*******************************************\n");
+
+        switch (op){
+            case CMD_SSD_0: case CMD_SSD_1: case CMD_SSD_2: case CMD_SSD_3: case CMD_SSD_4: case CMD_SSD_5: case CMD_SSD_6: case CMD_SSD_7:
+            case CMD_SSD_8: case CMD_SSD_9: case CMD_SSD_A: case CMD_SSD_B: case CMD_SSD_C: case CMD_SSD_D: case CMD_SSD_E: case CMD_SSD_F:
+                cmd.cmd = op;
+                xQueueSend(uartToSSDQueue, &cmd, 0);
+                break;
+
+            case CMD_RGB_HIGH:
+                cmd.cmd = PUSH_INCREMENT_STATE;
+                xQueueSend(uartToLEDIncQueue, &cmd, 0);
+                break;
+
+            case CMD_RGB_LOW:
+                cmd.cmd = PUSH_DECREMENT_STATE;
+                xQueueSend(uartToLEDIncQueue, &cmd, 0);
+                break;
+
+            case CMD_RGB_RED:
+                cmd.cmd = RGB_RED;
+                xQueueSend(uartToLEDClrQueue, &cmd, 0);
+                break;
+
+            case CMD_RGB_GREEN:
+                cmd.cmd = RGB_GREEN;
+                xQueueSend(uartToLEDClrQueue, &cmd, 0);
+                break;
+
+            case CMD_RGB_BLUE:
+                cmd.cmd = RGB_BLUE;
+                xQueueSend(uartToLEDClrQueue, &cmd, 0);
+                break;
+
+            case CMD_RGB_YELLOW:
+                cmd.cmd = RGB_YELLOW;
+                xQueueSend(uartToLEDClrQueue, &cmd, 0);
+                break;
+
+            case CMD_RGB_CYAN:
+                cmd.cmd = RGB_CYAN;
+                xQueueSend(uartToLEDClrQueue, &cmd, 0);
+                break;
+
+            case CMD_RGB_MAGENTA:
+                cmd.cmd = RGB_MAGENTA;
+                xQueueSend(uartToLEDClrQueue, &cmd, 0);
+                break;
+
+            case CMD_RGB_WHITE:
+                cmd.cmd = RGB_WHITE;
+                xQueueSend(uartToLEDClrQueue, &cmd, 0);
+                break;
+
+            default:
+                print_string("\nOption not recognized");
+                break;
+        }
+		
+        vTaskDelay(pdMS_TO_TICKS(POLL_DELAY_MS));
+        flush_uart();
+    }
+}
+  
+
+
+static void uart_init(void)
+{
+  XUartPs_Config *cfg;
+
+  cfg = XUartPs_LookupConfig(UART_BASEADDR);
+  if (!cfg){
+    while (1) {}
+  }
+
+  if (XUartPs_CfgInitialize(&UartPs, cfg, cfg->BaseAddress) != XST_SUCCESS){
+    while (1) {}
+  }
+
+  XUartPs_SetBaudRate(&UartPs, 115200);
+}
+
+static int uart_poll_rx(uint8_t *b)
+{
+  if (XUartPs_IsReceiveData(UartPs.Config.BaseAddress)){
+    *b = XUartPs_ReadReg(UartPs.Config.BaseAddress, XUARTPS_FIFO_OFFSET);
+    return 1;
+  }
+  return 0;
+}
+
+static void uart_tx_byte(uint8_t b)
+{
+  while (XUartPs_IsTransmitFull(UartPs.Config.BaseAddress)){  
+      
+  }
+  
+  XUartPs_WriteReg(UartPs.Config.BaseAddress, XUARTPS_FIFO_OFFSET, b);
+}
+
+void flush_uart(void)
+{
+    uint8_t dummy;    
+    while (xQueueReceive(q_rx_byte, &dummy, 0) == pdTRUE);
+}
+
+
+void print_string(const char *str)
+{
+    // reimplement new print function
+    xil_printf(str);
+    // while (*str) {
+    //     uint8_t c = *str++;
+    //     xQueueSend(q_tx, &c, pdMS_TO_TICKS(POLL_DELAY_MS));
+    // }
+}
+
+uint8_t receive_byte(uint8_t *out_byte)
+{
+    while(1){
+        if (xQueueReceive(q_rx_byte, out_byte, 0)!=pdTRUE){            
+            vTaskDelay(pdMS_TO_TICKS(POLL_DELAY_MS));
+        } else {
+            return *out_byte;
+        }
     }
 }
